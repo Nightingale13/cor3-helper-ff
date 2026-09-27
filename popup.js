@@ -6190,6 +6190,8 @@ function createDebugJobRow(job) {
 
     const statusEl = document.createElement('span');
     let st = job.status || 'open';
+    const notDoable = st === 'skipped' && typeof job.error === 'string' && job.error.startsWith('Requirements not met:');
+    if (notDoable) st = 'not-doable';
     if (st === 'open' && isJobBugged(job)) st = 'bugged';
     statusEl.className = 'debug-job-status ' + st;
     statusEl.textContent = st.toUpperCase();
@@ -6204,7 +6206,7 @@ function createDebugJobRow(job) {
     info.textContent = `${job.name} — ${job.serverName}`;
     row.appendChild(info);
 
-    if (job.status === 'failed' || job.status === 'skipped') {
+    if ((job.status === 'failed' || job.status === 'skipped') && !notDoable) {
         const penaltyVal = job.reputationPenalty || (job.reward && job.reward.deposit) || job.deposit || 0;
         if (penaltyVal > 0) {
             const penEl = document.createElement('span');

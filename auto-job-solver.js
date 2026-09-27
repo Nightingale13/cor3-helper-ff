@@ -1006,8 +1006,8 @@
         log('Loadout: found ' + hackCandidates.length + ' hack candidate(s) for ' + serverTypeName + (hackCandidates.length > 0 ? ' — best: ' + hackCandidates[0].sw.name + ' (power ' + (hackCandidates[0].spec.power || []).join('-') + ')' : ''));
 
         if (hackCandidates.length === 0) {
-            log('Loadout: no hack software available for ' + serverTypeName + ' — proceeding (may use existing access)', 'warn');
-            return true;
+            log('Loadout: no hack software available for ' + serverTypeName, 'warn');
+            return false;
         }
 
         var bestHack = hackCandidates[0];
@@ -1027,8 +1027,8 @@
             if (betterHw) {
                 targetHw = betterHw;
             } else {
-                log('Loadout: cannot boot hack software — skipping loadout change', 'warn');
-                return true;
+                log('Loadout: cannot boot hack software with owned hardware', 'warn');
+                return false;
             }
         }
 
@@ -1081,6 +1081,11 @@
             } else {
                 log('Loadout: no hardware upgrade available', 'warn');
             }
+        }
+
+        if (serverDefenceRate > 0 && computedHackPower < serverDefenceRate) {
+            log('Loadout: hack power ' + computedHackPower + ' < defence ' + serverDefenceRate, 'error');
+            return false;
         }
 
         if (!alreadyBest || targetHw !== currentHw) {
@@ -1561,10 +1566,16 @@
             function endpointHandler(evt) {
                 if (evt.data && evt.data.type === 'COR3_WS_ENDPOINT_RESULT') {
                     cleanup();
-                    // Check if the endpoint result is a no-path or maintenance error
-                    if (evt.data.success === false && evt.data.error &&
-                        (evt.data.error.message === 'no-path-to-server' || evt.data.error.message === 'server-in-maintenance')) {
-                        resolve({ ok: false, unreachable: true, errorMsg: evt.data.error.message });
+                    if (evt.data.success === false) {
+                        var endpointError = evt.data.error && evt.data.error.message
+                            ? evt.data.error.message
+                            : 'unknown endpoint error';
+                        // Route errors can use path-through.
+                        if (endpointError === 'no-path-to-server' || endpointError === 'server-in-maintenance') {
+                            resolve({ ok: false, unreachable: true, errorMsg: endpointError });
+                        } else {
+                            resolve({ ok: false, unreachable: false, errorMsg: endpointError });
+                        }
                     } else {
                         resolve({ ok: true, data: evt.data });
                     }
@@ -1593,7 +1604,7 @@
         // Skip if endpoint is already set to this server
         if (_lastEndpointServerId === serverId) {
             log('Endpoint already set to ' + endpointLabel + ' — skipping duplicate set.endpoint');
-            return;
+            return { ok: true, cached: true };
         }
 
         log('Setting endpoint to ' + endpointLabel);
@@ -1649,11 +1660,16 @@
             }
         }
 
+        if (raceResult.ok === false) {
+            throw new Error(endpointLabel + ' endpoint failed: ' + friendlyError(raceResult.errorMsg));
+        }
+
         if (raceResult.timeout) {
             log('Endpoint set timeout (may already be set)', 'warn');
         }
         _lastEndpointServerId = serverId;
         await delay(humanDelay());
+        return raceResult;
     }
 
     // Step: Login to server (use existing access or hack)
@@ -1857,6 +1873,50 @@
         await delay(humanDelay());
     }
 
+    // Verify route and access before accepting a job.
+    async function preflightJobRequirements(job) {
+        if (job.alreadyTaken) return true;
+        if (!job.jobId || !job.marketId) {
+            throw new Error('Job or market ID is missing');
+        }
+        if (!job.serverId && job.serverName && job.serverName !== 'None') {
+            throw new Error('Target server ID is missing for ' + job.serverName);
+        }
+
+        if (job.serverId) {
+            log('Preflight: checking ' + jobLabel(job));
+
+            var loadoutReady = await ensureLoadoutForJob(job);
+            if (loadoutReady === false) {
+                throw new Error('No usable hacking loadout');
+            }
+
+            await stepSetEndpoint(job.serverId);
+            await stepLogin(job.serverId);
+        } else {
+            log('Preflight: no server required');
+        }
+
+        // Verify and restore the remote market endpoint.
+        var marketEndpointResult = null;
+        if (job.marketKey === 'dark') {
+            marketEndpointResult = await stepSetEndpoint(DARK_MARKET_SERVER_ID);
+        } else if (job.marketKey === 'soyuz') {
+            marketEndpointResult = await stepSetEndpoint(SOYUZ_MARKET_SERVER_ID);
+        } else if (job.marketKey === 'usol') {
+            marketEndpointResult = await stepSetEndpoint(USOL_MARKET_SERVER_ID);
+        }
+        if (marketEndpointResult && marketEndpointResult.timeout) {
+            throw new Error('Remote market route not verified');
+        }
+
+        job.doable = true;
+        job.requirementsChecked = true;
+        job.requirementsCheckedAt = new Date().toISOString();
+        log('✅ Preflight passed: ' + jobLabel(job), 'success');
+        return true;
+    }
+
     // Step: Take a job from market (tracks deposit paid)
     // After taking, refreshes market data and updates job.conditions from recentJobs
     async function stepTakeJob(job) {
@@ -1864,6 +1924,9 @@
         if (job.alreadyTaken) {
             log('Job already taken — skipping take step');
             return;
+        }
+        if (job.doable !== true || job.requirementsChecked !== true) {
+            throw new Error('Job requirements not verified');
         }
         log('Taking job: ' + jobLabel(job));
 
@@ -3835,11 +3898,39 @@
             _currentJobRef = job;
             updateTracker();
 
-            // Pre-check loadout for this job (equip hack/decrypt software if needed)
-            try {
-                await ensureLoadoutForJob(job);
-            } catch (loadoutErr) {
-                log('Loadout pre-check warning: ' + loadoutErr.message + ' — proceeding anyway', 'warn');
+            // Preflight new jobs; keep processing jobs already taken.
+            if (!job.alreadyTaken) {
+                try {
+                    await preflightJobRequirements(job);
+                } catch (preflightErr) {
+                    if (preflightErr.message === 'Aborted' || abortFlag) {
+                        job.status = 'skipped';
+                        job.error = 'Aborted by user during requirements check';
+                        job.doable = false;
+                        job.requirementsChecked = true;
+                        _currentJobRef = null;
+                        updateTracker();
+                        break;
+                    }
+
+                    job.status = 'skipped';
+                    job.doable = false;
+                    job.requirementsChecked = true;
+                    job.requirementsCheckedAt = new Date().toISOString();
+                    job.error = 'Requirements not met: ' + friendlyError(preflightErr.message);
+                    if (preflightErr.lockExpiresAt) job.lockExpiresAt = preflightErr.lockExpiresAt;
+                    log('⚠️ Not doable: ' + jobLabel(job) + ' — ' + friendlyError(preflightErr.message), 'warn');
+                    _currentJobRef = null;
+                    updateTracker();
+                    saveCompletedResultsIncremental();
+                    continue;
+                }
+            } else {
+                try {
+                    await ensureLoadoutForJob(job);
+                } catch (loadoutErr) {
+                    log('Loadout pre-check warning: ' + loadoutErr.message + ' — proceeding anyway', 'warn');
+                }
             }
 
             try {
