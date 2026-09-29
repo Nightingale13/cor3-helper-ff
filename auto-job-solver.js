@@ -1873,6 +1873,156 @@
         await delay(humanDelay());
     }
 
+    function addDecryptFileType(meta, value, isName) {
+        if (typeof value !== 'string' || !value) return;
+        var fileType = value.trim();
+        if (isName) {
+            var dot = fileType.lastIndexOf('.');
+            if (dot < 0) return;
+            fileType = fileType.substring(dot);
+        } else if (fileType[0] !== '.') {
+            fileType = '.' + fileType;
+        }
+        fileType = fileType.toLowerCase();
+        var target = isName ? meta.namedFileTypes : meta.fileTypes;
+        if (target.indexOf(fileType) < 0) target.push(fileType);
+    }
+
+    function scanDecryptMetadata(value, meta, decryptContext, seen) {
+        if (!value || typeof value !== 'object') return;
+        if (seen.indexOf(value) >= 0) return;
+        seen.push(value);
+        if (Array.isArray(value)) {
+            for (var ai = 0; ai < value.length; ai++) {
+                scanDecryptMetadata(value[ai], meta, decryptContext, seen);
+            }
+            return;
+        }
+
+        var typeValue = value.type || value.conditionType || '';
+        var localDecrypt = decryptContext || (typeof typeValue === 'string' && /decrypt/i.test(typeValue));
+        var keys = Object.keys(value);
+        for (var i = 0; i < keys.length; i++) {
+            var key = keys[i];
+            var lower = key.toLowerCase();
+            var child = value[key];
+            var numberValue = typeof child === 'number' ? child :
+                (typeof child === 'string' && /^\d+(\.\d+)?$/.test(child) ? Number(child) : 0);
+
+            if (numberValue > 0 && (lower === 'cryptrate' || lower === 'decryptrate' ||
+                lower === 'encryptionrate' || lower === 'requireddecryptpower' ||
+                lower === 'decryptpowerrequired' || lower === 'decryptrequirement' ||
+                (localDecrypt && lower === 'requiredpower'))) {
+                meta.requiredPower = Math.max(meta.requiredPower, numberValue);
+            }
+            if (typeof child === 'string') {
+                if (lower === 'fileextension' || lower === 'filetype' || lower === 'extension') {
+                    addDecryptFileType(meta, child, false);
+                } else if (localDecrypt && (lower === 'filename' || lower === 'name')) {
+                    addDecryptFileType(meta, child, true);
+                }
+            }
+            scanDecryptMetadata(child, meta, localDecrypt || lower.indexOf('decrypt') >= 0, seen);
+        }
+    }
+
+    function getDecryptCandidates(loadout, fileType) {
+        var candidates = [];
+        var allSoftware = loadout.ownedSoftware || [];
+        for (var i = 0; i < allSoftware.length; i++) {
+            var specs = normSpecs(allSoftware[i]);
+            for (var si = 0; si < specs.length; si++) {
+                if (specs[si].type !== 'DECRYPT') continue;
+                var fileTypes = specs[si].fileTypes || [];
+                var matches = !fileType || fileTypes.some(function (ft) {
+                    return String(ft).toLowerCase() === fileType;
+                });
+                if (matches) candidates.push({ sw: allSoftware[i], spec: specs[si] });
+            }
+        }
+        return candidates;
+    }
+
+    function getBestDecryptPower(loadout, fileType) {
+        var candidates = getDecryptCandidates(loadout, fileType);
+        var bestPower = 0;
+        for (var i = 0; i < candidates.length; i++) {
+            var swId = candidates[i].sw.id;
+            var hardwareOptions = [loadout.equippedHardware || {}];
+            var bestHardware = findBestHardware(loadout, [swId]);
+            if (bestHardware) hardwareOptions.push(bestHardware);
+            for (var hi = 0; hi < hardwareOptions.length; hi++) {
+                var testLoadout = JSON.parse(JSON.stringify(loadout));
+                testLoadout.equippedHardware = hardwareOptions[hi];
+                var analysis = calculateAnalysis(testLoadout, [swId]);
+                if (!analysis.canBoot || !analysis.swAnalysis[swId]) continue;
+                var abilities = analysis.swAnalysis[swId].abilities || [];
+                for (var abi = 0; abi < abilities.length; abi++) {
+                    if (abilities[abi].type === 'DECRYPT') {
+                        bestPower = Math.max(bestPower, abilities[abi].computedPower || 0);
+                    }
+                }
+            }
+        }
+        return { power: bestPower, hasSoftware: candidates.length > 0 };
+    }
+
+    async function fetchOpenJob(job) {
+        var eventTypes = {
+            home: 'COR3_WS_MARKET',
+            dark: 'COR3_WS_DARK_MARKET',
+            soyuz: 'COR3_WS_SOYUZ_MARKET',
+            usol: 'COR3_WS_USOL_MARKET'
+        };
+        var eventType = eventTypes[job.marketKey];
+        if (!eventType) return null;
+        sendCmd('get.jobs', { marketId: job.marketId });
+        var response = await waitForEvent(eventType, 10000);
+        var market = response && response.market;
+        if (!market || !Array.isArray(market.jobs)) return null;
+        return market.jobs.find(function (item) { return item.id === job.jobId; }) || null;
+    }
+
+    async function checkDecryptRequirements(job) {
+        var type = job.type || job.name || '';
+        if (type !== 'File Decryption' && type !== 'Decrypt & Extract' && type !== 'Data Download') return;
+
+        var openJob;
+        try {
+            openJob = await fetchOpenJob(job);
+        } catch (e) {
+            throw new Error('Decrypt requirements unavailable');
+        }
+        if (!openJob) throw new Error('Decrypt requirements unavailable');
+
+        var meta = { requiredPower: 0, fileTypes: [], namedFileTypes: [] };
+        scanDecryptMetadata(openJob, meta, /decrypt/i.test(type), []);
+        if (type === 'Data Download' && !jobConditionsRequireDecrypt({
+            conditions: openJob.conditions ? openJob.conditions.items || openJob.conditions : []
+        })) return;
+
+        var loadout = await getLoadoutData(true);
+        if (!loadout) throw new Error('Decrypt loadout unavailable');
+
+        var anyTypePower = getBestDecryptPower(loadout, null);
+        if (!anyTypePower.hasSoftware) throw new Error('No decrypt software');
+        if (meta.requiredPower > 0 && anyTypePower.power < meta.requiredPower) {
+            throw new Error('Decrypt power ' + anyTypePower.power + ' < ' + meta.requiredPower);
+        }
+        if (meta.requiredPower <= 0) throw new Error('Decrypt power requirement unavailable');
+        if (meta.fileTypes.length === 0) meta.fileTypes = meta.namedFileTypes;
+        if (meta.fileTypes.length === 0) throw new Error('Decrypt file type unavailable');
+
+        var fileType = meta.fileTypes[0];
+        var result = getBestDecryptPower(loadout, fileType);
+        if (!result.hasSoftware) throw new Error('No decrypt software for ' + fileType);
+        if (result.power < meta.requiredPower) {
+            throw new Error('Decrypt power ' + result.power + ' < ' + meta.requiredPower);
+        }
+        job.fileType = fileType;
+        log('Decrypt preflight: ' + result.power + ' / ' + meta.requiredPower);
+    }
+
     // Verify route and access before accepting a job.
     async function preflightJobRequirements(job) {
         if (job.alreadyTaken) return true;
@@ -1909,6 +2059,8 @@
         if (marketEndpointResult && marketEndpointResult.timeout) {
             throw new Error('Remote market route not verified');
         }
+
+        await checkDecryptRequirements(job);
 
         job.doable = true;
         job.requirementsChecked = true;
